@@ -17,12 +17,19 @@ import numpy as np
 import pyspike as spk
 
 from pyspike import SpikeTrain as SpikeTrainPy
-
 from viziphant.rasterplot import rasterplot_rates
 from elephant.statistics import isi, cv
 import neo
 from neo import SpikeTrain as SpikeTrainN
 
+from elephant.conversion import BinnedSpikeTrain
+from elephant.spike_train_correlation import correlation_coefficient
+from viziphant.spike_train_correlation import plot_corrcoef
+import networkx as nx
+
+import numpy as np
+from matplotlib import pyplot as plt
+import pyspike as spk
 
 # ----------------------------------------------------------------------------
 # Parameters
@@ -37,7 +44,7 @@ POPULATION_NAMES = ["E", "I"]
 DT_MS = 0.1
 
 # Simulation duration [ms]
-DURATION_MS = 1000.0
+DURATION_MS = 3000.0
 
 # Should kernel timing be measured?
 MEASURE_TIMING = True
@@ -52,19 +59,20 @@ BUILD_MODEL = True
 NUM_THREADS_PER_SPIKE = 8
 
 # Scaling factors for number of neurons and synapses
-NEURON_SCALING_FACTOR = 1.0
-CONNECTIVITY_SCALING_FACTOR = 1.0
+NEURON_SCALING_FACTOR = 1.0/100.0
+CONNECTIVITY_SCALING_FACTOR = 1.0/1.225
 
 # Background rate per synapse
-BACKGROUND_RATE = 8.0  # spikes/s
+BACKGROUND_RATE = 4.5  # spikes/s
 
 # Relative inhibitory synaptic weight
-G = -4.0
+G = -5.5
 
 # Mean synaptic weight for all excitatory projections except L4e->L2/3e
-MEAN_W = 87.8e-3  # nA
+MEAN_W = 87.8e-4  # nA
+MEAN_W = MEAN_W*0.85
 EXTERNAL_W = 87.8e-3   # nA
-
+EXTERNAL_W = EXTERNAL_W*0.85
 # Mean synaptic weight for L4e->L2/3e connections
 # See p. 801 of the paper, second paragraph under 'Model Parameterization',
 # and the caption to Supplementary Fig. 7
@@ -85,11 +93,12 @@ NUM_NEURONS = {
     "4":    {"E":21915, "I": 5479},
     "5":    {"E":4850,  "I": 1065},
     "6":    {"E":14395, "I": 2948}}
-
+"""
 scale_factor = 200
 for k1,v1 in NUM_NEURONS.items():
     for k2,v2 in v1.items():
         NUM_NEURONS[k1][k2] = int(v2/scale_factor)
+"""
 # Probabilities for >=1 connection between neurons in the given populations.
 # The first index is for the target population; the second for the source population
 CONNECTION_PROBABILTIES = {
@@ -101,7 +110,7 @@ CONNECTION_PROBABILTIES = {
     "5I":   {"23E": 0.0548, "23I": 0.0269,  "4E": 0.0257,   "4I": 0.0022,   "5E": 0.06,     "5I": 0.3158,   "6E": 0.0086,   "6I": 0.0},
     "6E":   {"23E": 0.0156, "23I": 0.0066,  "4E": 0.0211,   "4I": 0.0166,   "5E": 0.0572,   "5I": 0.0197,   "6E": 0.0396,   "6I": 0.2252},
     "6I":   {"23E": 0.0364, "23I": 0.001,   "4E": 0.0034,   "4I": 0.0005,   "5E": 0.0277,   "5I": 0.008,    "6E": 0.0658,   "6I": 0.1443}}
-
+#scale_factor=1.25
 #for k1,v1 in CONNECTION_PROBABILTIES.items():
 #    for k2,v2 in v1.items():
 #        CONNECTION_PROBABILTIES[k1][k2] = int(v2/scale_factor)
@@ -114,7 +123,7 @@ NUM_EXTERNAL_INPUTS = {
     "5":    {"E": 2000, "I": 1900},
     "6":    {"E": 2900, "I": 2100}}
 
-scale_factor = 1
+scale_factor = 1.125
 for k1,v1 in NUM_EXTERNAL_INPUTS.items():
     for k2,v2 in v1.items():
         NUM_EXTERNAL_INPUTS[k1][k2] = int(v2/scale_factor)
@@ -252,7 +261,6 @@ for layer in LAYER_NAMES:
         ext_weight = EXTERNAL_W / np.sqrt(CONNECTIVITY_SCALING_FACTOR)
         ext_input_current = 0.001 * 0.5 * (1.0 - np.sqrt(CONNECTIVITY_SCALING_FACTOR)) * get_full_mean_input_current(layer, pop)
         assert ext_input_current >= 0.0
-
         lif_params = {"C": 0.25, "TauM": 10.0, "Vrest": -65.0, "Vreset": -65.0, "Vthresh" : -50.0,
                       "Ioffset": ext_input_current, "TauRefrac": 2.0}
         poisson_params = {"weight": ext_weight, "tauSyn": 0.5, "rate": ext_input_rate}
@@ -273,6 +281,41 @@ for layer in LAYER_NAMES:
         neuron_populations[pop_name] = neuron_pop
 
 # Loop through target populations and layers
+# STDP
+stdp_model = genn_model.create_custom_weight_update_class(
+    "stdp_model",
+    param_names=["tauMinus", "gMax", "Xtar", "mu"],
+    var_name_types=[("g", "scalar"), ("eta", "scalar")],
+    pre_var_name_types=[("Xpre", "scalar")],
+
+    sim_code=
+        """
+        $(addToInSyn, $(g));
+        """,
+
+    learn_post_code=
+        """
+        const scalar dt = $(t) - $(sT_pre);
+        if(dt > 0) {
+            const scalar expXpre = $(Xpre) * exp(-dt / $(tauMinus));
+            const scalar newG = $(g) - (($(eta) * (expXpre - $(Xtar)) * pow(($(gMax) - $(g)),$(mu))));
+            $(g) = $(gMax) <= newG ? $(gMax) : newG;
+        }
+        """,
+
+    pre_spike_code=
+        """
+        const scalar dt = $(t) - $(sT_pre);
+        if(dt > 0) {
+            const scalar expXpre = exp(-dt / $(tauMinus));
+            $(Xpre) = expXpre + 1.0;
+        }
+        """,
+
+    is_pre_spike_time_required=True,
+    is_post_spike_time_required=True
+)
+
 print("Creating synapse populations:")
 total_synapses = 0
 num_sub_rows = NUM_THREADS_PER_SPIKE if PROCEDURAL_CONNECTIVITY else 1
@@ -394,13 +437,13 @@ sim_end_time =  perf_counter()
 model.pull_recording_buffers_from_device()
 
 print("Timing:")
-print("\tSimulation:%f" % ((sim_end_time - sim_start_time) * 1000.0))
+print("\tSimulation:%f" % ((sim_end_time - sim_start_time) * DURATION_MS))
 
 if MEASURE_TIMING:
-    print("\tInit:%f" % (1000.0 * model.init_time))
-    print("\tSparse init:%f" % (1000.0 * model.init_sparse_time))
-    print("\tNeuron simulation:%f" % (1000.0 * model.neuron_update_time))
-    print("\tSynapse simulation:%f" % (1000.0 * model.presynaptic_update_time))
+    print("\tInit:%f" % (DURATION_MS * model.init_time))
+    print("\tSparse init:%f" % (DURATION_MS * model.init_sparse_time))
+    print("\tNeuron simulation:%f" % (DURATION_MS * model.neuron_update_time))
+    print("\tSynapse simulation:%f" % (DURATION_MS * model.presynaptic_update_time))
 
 
 # Create plot
@@ -420,12 +463,12 @@ for ind,pop in enumerate(ordered_neuron_populations):
     for j in range(0,max(spike_ids)):
         spike_times_ = list(spike_times[np.where(spike_ids==j)])
         #if len(spike_times_) > 0:
-        sts.append(SpikeTrainPy(spike_times_,edges=(0.0,1000.0)))
+        sts.append(SpikeTrainPy(spike_times_,edges=(0.0,DURATION_MS)))
     #print(sts[-1].get_spikes_non_empty())
     actor = axes[0].scatter(spike_times, spike_ids + start_id, s=2, edgecolors="none")
 
     # Plot bar showing rate in matching colour
-    axes[1].barh(bar_y, len(spike_times) / (float(pop.size) * DURATION_MS / 1000.0),
+    axes[1].barh(bar_y, len(spike_times) / (float(pop.size) * DURATION_MS / DURATION_MS),
                  align="center", color=actor.get_facecolor(), ecolor="black")
 
     # Update offset
@@ -434,7 +477,7 @@ for ind,pop in enumerate(ordered_neuron_populations):
     # Update bar pos
     bar_y += 1.0
 #sts_ = np.random.choice(sts, size=45, replace=True)#, p=None)
-#trs = SpikeTrain(sts_,edges=(0.0,1000.0))
+#trs = SpikeTrain(sts_,edges=(0.0,DURATION_MS))
 #print(len(trs))
 trs = sts
 axes[0].set_xlabel("Time [ms]")
@@ -443,11 +486,35 @@ axes[0].set_ylabel("Neuron number")
 axes[1].set_xlabel("Mean firingrate [Hz]")
 axes[1].set_yticks(np.arange(0.0, len(neuron_populations), 1.0))
 axes[1].set_yticklabels([n.name for n in ordered_neuron_populations])
+plt.savefig("spike_raster.png")
 
 #import pdb; pdb.set_trace()
 # Show plot
-plt.savefig("spike_raster.png")
-spike_distance = spk.spike_distance_matrix(trs, interval=(0,1000))
+plt.figure()
+
+spike_profile = spk.spike_profile(trs)
+x, y = spike_profile.get_plottable_data()
+plt.plot(x, y, '--k')
+avg = spike_profile.avrg()
+for i,j in zip(x,y):
+    if i>avg:
+        print(i,j,avg)
+print("SPIKE distance: %.8f" % avg)
+plt.savefig("spike_distance_profile.png")
+
+E = spk.spike_train_order_profile(trs)
+
+plt.figure()
+x, y = E.get_plottable_data()
+plt.plot(x, y, '-ob')
+plt.ylim(-1.1, 1.1)
+plt.xlabel("t")
+plt.ylabel("E")
+plt.title("Spike Train Order Profile")
+
+plt.savefig("leader_follower.png")
+
+spike_distance = spk.spike_distance_matrix(trs, interval=(0,DURATION_MS))
 plt.figure()
 plt.imshow(spike_distance, interpolation='none')
 plt.savefig("spike_distance.png")
@@ -471,7 +538,7 @@ spiketrains = []
 spiketrains_np = np.array([])#[]
 
 for spikes_ in trs:
-    st = SpikeTrainN(spikes_.get_spikes_non_empty() * pq.ms, t_stop=1000.0 * pq.ms)
+    st = SpikeTrainN(spikes_.get_spikes_non_empty() * pq.ms, t_stop=DURATION_MS * pq.ms)
     spiketrains.append(st)
     spiketrains_np = np.concatenate([st,spiketrains_np])
 
@@ -479,28 +546,104 @@ for spikes_ in trs:
 
 patterns = spade.spade(spiketrains, bin_size=400 * pq.ms,
                        winlen=1)['patterns']
-
+figure = plt.figure()
 rasterplot_rates(spiketrains)
 plt.savefig("raster_rate_rug.png")
+axes = viziphant.patterns.plot_patterns(spiketrains, patterns)
 figure = plt.figure()
-axes = viziphant.patterns.plot_patterns(spiketrains, patterns[:2])
 plt.savefig("patterns0.png")
 figure = plt.figure()
 axes = viziphant.patterns.plot_patterns_statistics_all(patterns)
 plt.savefig("patterns1.png")
+figure = plt.figure()
 cv_list = [cv(isi(spiketrain)) for spiketrain in spiketrains]
 plt.hist(cv_list)
 plt.savefig("cv_hist.png")
-try:
-    UE = ue.jointJ_window_analysis(
-        spiketrains_np, binsize=5*pq.ms, winsize=100*pq.ms, winstep=10*pq.ms, pattern_hash=[3])
-    #print(UE)
-    plot_UE(spiketrains_np, UE, ue.jointJ(0.05),binsize=5*pq.ms,winsize=100*pq.ms,winstep=10*pq.ms,
-            pat=ue.inverse_hash_from_pattern([3], N=2), N=2,
-            t_winpos=ue._winpos(0*pq.ms,spiketrains[0][0].t_stop,winsize=100*pq.ms,winstep=10*pq.ms))
-    plt.savefig("unitary_event_analysis.png")
 
-except:
-    pass
+np.random.seed(0)
+binned_spiketrains = BinnedSpikeTrain(spiketrains, bin_size=5*pq.ms)
+corrcoef_matrix = correlation_coefficient(binned_spiketrains)
+
+#nx.Graph()
+threshold = 0.08
+simple_weights = np.array(corrcoef_matrix)
+#print(np.sum(simple_weights))
+simple_weights[np.abs(simple_weights)<threshold] = 0
+simple_weights[simple_weights==1] = 0
+
+#print(np.sum(simple_weights))
+#import pdb; pdb.set_trace()
+G = nx.from_numpy_matrix(simple_weights, create_using=nx.DiGraph, parallel_edges=False)
+figure = plt.figure()
+le_ids = [(a,b) for a, b, attrs in G.edges(data=True) if np.abs(attrs["weight"]) < 0.225]
+G.remove_edges_from(le_ids)
+#nx.draw(G, pos=nx.spring_layout(G))
+#plt.savefig("reconstructed_network2.png")
+fig, axes = plt.subplots()
+plot_corrcoef(corrcoef_matrix, axes=axes)
+axes.set_xlabel('Neuron')
+axes.set_ylabel('Neuron')
+axes.set_title("Correlation coefficient matrix")
+plt.savefig("corr_matrix.png")
+
+
+#from elephant.gpfa import GPFA
+
+
+# specify fitting parameters
+"""
+bin_size = 20 * pq.ms
+latent_dimensionality = 2
+from GA import GPFA
+
+gpfa_2dim = GPFA(bin_size=bin_size, x_dim=latent_dimensionality)
+gpfa_2dim.fit(spiketrains)
+print(gpfa_2dim.params_estimated.keys())
+trajectories = gpfa_2dim.transform(spiketrains)
+
+f, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+
+linewidth_single_trial = 0.5
+color_single_trial = 'C0'
+alpha_single_trial = 0.5
+
+linewidth_trial_average = 2
+color_trial_average = 'C1'
+ax2.set_title('Latent dynamics extracted by GPFA')
+ax2.set_xlabel('Dim 1')
+ax2.set_ylabel('Dim 2')
+ax2.set_aspect(1)
+# single trial trajectories
+for single_trial_trajectory in trajectories:
+    ax2.plot(single_trial_trajectory[0], single_trial_trajectory[1], '-', lw=linewidth_single_trial, c=color_single_trial, alpha=alpha_single_trial)
+# trial averaged trajectory
+average_trajectory = np.mean(trajectories, axis=0)
+ax2.plot(average_trajectory[0], average_trajectory[1], '-', lw=linewidth_trial_average, c=color_trial_average, label='Trial averaged trajectory')
+ax2.legend()
+
+plt.tight_layout()
+plt.show()
+"""
+#plt.show()
+#cch, lags = cross_correlation_histogram(spiketrains)
+
+#plot_cross_correlation_histogram(cch)
+#viziphant.plot_corrcoef(corrcoef_matrix)
+
+#print(np.shape(spiketrains_np))
+#import pdb; pdb.set_trace()
+#temp = np.array(spiketrains)
+#UE = ue.jointJ_window_analysis(temp.T, binsize=5*pq.ms, winsize=100*pq.ms, winstep=10*pq.ms, pattern_hash=[3])
+#print(UE)
+#figure = plt.figure()
+
+#plot_UE(spiketrains_np, UE, ue.jointJ(0.05),binsize=5*pq.ms,winsize=100*pq.ms,winstep=10*pq.ms,#
+#        pat=ue.inverse_hash_from_pattern([3], N=2), N=2,
+#        t_winpos=ue._winpos(0*pq.ms,spiketrains[0][0].t_stop,winsize=100*pq.ms,winstep=10*pq.ms))
+#plt.savefig("unitary_event_analysis.png")
+
+#except:
+#    print('fail')
+#    pass
 
 #st.pyplot()
