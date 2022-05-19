@@ -1,10 +1,28 @@
-import numpy as np 
-import matplotlib.pyplot as plt 
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from elephant import spade#, SpikeTrain
+import viziphant
+import numpy as np
+import elephant.unitary_event_analysis as ue
+
+import quantities as pq
 from pygenn import genn_model, genn_wrapper
 from scipy.stats import norm
 from six import iteritems, itervalues
 from time import perf_counter
+
+import numpy as np
+import pyspike as spk
+
+from pyspike import SpikeTrain as SpikeTrainPy
+
+from viziphant.rasterplot import rasterplot_rates
+from elephant.statistics import isi, cv
+import neo
+from neo import SpikeTrain as SpikeTrainN
+
 
 # ----------------------------------------------------------------------------
 # Parameters
@@ -68,6 +86,10 @@ NUM_NEURONS = {
     "5":    {"E":4850,  "I": 1065},
     "6":    {"E":14395, "I": 2948}}
 
+scale_factor = 200
+for k1,v1 in NUM_NEURONS.items():
+    for k2,v2 in v1.items():
+        NUM_NEURONS[k1][k2] = int(v2/scale_factor)
 # Probabilities for >=1 connection between neurons in the given populations.
 # The first index is for the target population; the second for the source population
 CONNECTION_PROBABILTIES = {
@@ -79,7 +101,11 @@ CONNECTION_PROBABILTIES = {
     "5I":   {"23E": 0.0548, "23I": 0.0269,  "4E": 0.0257,   "4I": 0.0022,   "5E": 0.06,     "5I": 0.3158,   "6E": 0.0086,   "6I": 0.0},
     "6E":   {"23E": 0.0156, "23I": 0.0066,  "4E": 0.0211,   "4I": 0.0166,   "5E": 0.0572,   "5I": 0.0197,   "6E": 0.0396,   "6I": 0.2252},
     "6I":   {"23E": 0.0364, "23I": 0.001,   "4E": 0.0034,   "4I": 0.0005,   "5E": 0.0277,   "5I": 0.008,    "6E": 0.0658,   "6I": 0.1443}}
-    
+
+#for k1,v1 in CONNECTION_PROBABILTIES.items():
+#    for k2,v2 in v1.items():
+#        CONNECTION_PROBABILTIES[k1][k2] = int(v2/scale_factor)
+
 
 # In-degrees for external inputs
 NUM_EXTERNAL_INPUTS = {
@@ -87,6 +113,11 @@ NUM_EXTERNAL_INPUTS = {
     "4":    {"E": 2100, "I": 1900},
     "5":    {"E": 2000, "I": 1900},
     "6":    {"E": 2900, "I": 2100}}
+
+scale_factor = 1
+for k1,v1 in NUM_EXTERNAL_INPUTS.items():
+    for k2,v2 in v1.items():
+        NUM_EXTERNAL_INPUTS[k1][k2] = int(v2/scale_factor)
 
 # Mean rates in the full-scale model, necessary for scaling
 # Precise values differ somewhat between network realizations
@@ -173,6 +204,42 @@ print("Max excitatory delay:%fms , max inhibitory delay:%fms" % (max_delay["E"],
 max_dendritic_delay_slots = int(round(max(itervalues(max_delay)) / DT_MS))
 print("Max dendritic delay slots:%d" % max_dendritic_delay_slots)
 
+
+def dontdo():
+    def record(self):
+        # If anything should be recorded from this area
+        # **YUCK** this is gonna be slow
+        if self.name in self.simulation.params['recording_dict']['areas_recorded']:
+            # Loop through GeNN populations in area
+            for pop, genn_pop in iteritems(self.genn_pops):
+                # Pull spikes from device
+                self.simulation.model.pull_current_spikes_from_device(genn_pop.name)
+
+                # Add copy of current spikes to list of this population's spike data
+                self.spike_data[pop].append(np.copy(genn_pop.current_spikes))
+
+    def write_recorded_data(self):
+        # Determine path for recorded data
+        recording_path = os.path.join(self.simulation.data_dir, 'recordings')
+
+        timesteps = np.arange(0.0, self.simulation.T, self.simulation.params['dt'])
+
+        # If anything should be recorded from this area
+        # **YUCK** this is gonna be slow
+        if self.name in self.simulation.params['recording_dict']['areas_recorded']:
+            for pop, data in iteritems(self.spike_data):
+                # Determine how many spikes were emitted in each timestep
+                spikes_per_timestep = [len(d) for d in data]
+                assert len(timesteps) == len(spikes_per_timestep)
+
+                # Repeat timesteps correct number of times to match number of spikes
+                spike_times = np.repeat(timesteps, spikes_per_timestep)
+                spike_ids = np.hstack(data)
+
+                # Write recorded data to disk
+                np.save(os.path.join(recording_path, self.name + "_" + pop + ".npy"), [spike_times, spike_ids])
+
+
 print("Creating neuron populations:")
 total_neurons = 0
 neuron_populations = {}
@@ -234,7 +301,7 @@ for trg_layer in LAYER_NAMES:
                     num_src_neurons = get_scaled_num_neurons(src_layer, src_pop)
                     num_trg_neurons = get_scaled_num_neurons(trg_layer, trg_pop)
 
-                    print("\tConnection between '%s' and '%s': numConnections=%u, meanWeight=%f, weightSD=%f, meanDelay=%f, delaySD=%f" 
+                    print("\tConnection between '%s' and '%s': numConnections=%u, meanWeight=%f, weightSD=%f, meanDelay=%f, delaySD=%f"
                           % (src_name, trg_name, num_connections, mean_weight, weight_sd, MEAN_DELAY[src_pop], DELAY_SD[src_pop]))
 
                     # Build parameters for fixed number total connector
@@ -253,7 +320,7 @@ for trg_layer in LAYER_NAMES:
                     # Excitatory
                     if src_pop == "E":
                         # Build distribution for weight parameters
-                        # **HACK** np.float32 doesn't seem to automatically cast 
+                        # **HACK** np.float32 doesn't seem to automatically cast
                         w_dist = {"mean": mean_weight, "sd": weight_sd, "min": 0.0, "max": float(np.finfo(np.float32).max)}
 
                         # Create weight parameters
@@ -276,7 +343,7 @@ for trg_layer in LAYER_NAMES:
                     # Inhibitory
                     else:
                         # Build distribution for weight parameters
-                        # **HACK** np.float32 doesn't seem to automatically cast 
+                        # **HACK** np.float32 doesn't seem to automatically cast
                         w_dist = {"mean": mean_weight, "sd": weight_sd, "min": float(-np.finfo(np.float32).max), "max": 0.0}
 
                         # Create weight parameters
@@ -318,7 +385,8 @@ while model.t < DURATION_MS:
     # Indicate every 10%
     if (model.timestep % ten_percent_timestep) == 0:
         print("%u%%" % (model.timestep / 100))
-        
+        print("stuck...?")
+
 sim_end_time =  perf_counter()
 
 
@@ -343,15 +411,21 @@ ordered_neuron_populations = list(reversed(list(itervalues(neuron_populations)))
 
 start_id = 0
 bar_y = 0.0
-for pop in ordered_neuron_populations:
+trs = []
+sts = []
+for ind,pop in enumerate(ordered_neuron_populations):
     # Get recording data
+    spike_times_ = []
     spike_times, spike_ids = pop.spike_recording_data
-    
-    # Plot spikes
+    for j in range(0,max(spike_ids)):
+        spike_times_ = list(spike_times[np.where(spike_ids==j)])
+        #if len(spike_times_) > 0:
+        sts.append(SpikeTrainPy(spike_times_,edges=(0.0,1000.0)))
+    #print(sts[-1].get_spikes_non_empty())
     actor = axes[0].scatter(spike_times, spike_ids + start_id, s=2, edgecolors="none")
 
     # Plot bar showing rate in matching colour
-    axes[1].barh(bar_y, len(spike_times) / (float(pop.size) * DURATION_MS / 1000.0), 
+    axes[1].barh(bar_y, len(spike_times) / (float(pop.size) * DURATION_MS / 1000.0),
                  align="center", color=actor.get_facecolor(), ecolor="black")
 
     # Update offset
@@ -359,7 +433,10 @@ for pop in ordered_neuron_populations:
 
     # Update bar pos
     bar_y += 1.0
-
+#sts_ = np.random.choice(sts, size=45, replace=True)#, p=None)
+#trs = SpikeTrain(sts_,edges=(0.0,1000.0))
+#print(len(trs))
+trs = sts
 axes[0].set_xlabel("Time [ms]")
 axes[0].set_ylabel("Neuron number")
 
@@ -367,6 +444,63 @@ axes[1].set_xlabel("Mean firingrate [Hz]")
 axes[1].set_yticks(np.arange(0.0, len(neuron_populations), 1.0))
 axes[1].set_yticklabels([n.name for n in ordered_neuron_populations])
 
+#import pdb; pdb.set_trace()
 # Show plot
-plt.show()
+plt.savefig("spike_raster.png")
+spike_distance = spk.spike_distance_matrix(trs, interval=(0,1000))
+plt.figure()
+plt.imshow(spike_distance, interpolation='none')
+plt.savefig("spike_distance.png")
+plt.title("SPIKE-distance")
+plt.figure()
 
+isi_distance = spk.isi_distance_matrix(trs)
+plt.imshow(isi_distance, interpolation='none')
+plt.title("ISI-distance")
+plt.savefig("isi_distance.png")
+
+
+plt.figure()
+spike_sync = spk.spike_sync_matrix(trs)#, interval=(0,4000))
+plt.imshow(spike_sync, interpolation='none')
+plt.title("SPIKE-Sync")
+plt.savefig("sync_distance.png")
+
+plt.show()
+spiketrains = []
+spiketrains_np = np.array([])#[]
+
+for spikes_ in trs:
+    st = SpikeTrainN(spikes_.get_spikes_non_empty() * pq.ms, t_stop=1000.0 * pq.ms)
+    spiketrains.append(st)
+    spiketrains_np = np.concatenate([st,spiketrains_np])
+
+#spiketrains = np.vstack(spiketrains_).T
+
+patterns = spade.spade(spiketrains, bin_size=400 * pq.ms,
+                       winlen=1)['patterns']
+
+rasterplot_rates(spiketrains)
+plt.savefig("raster_rate_rug.png")
+figure = plt.figure()
+axes = viziphant.patterns.plot_patterns(spiketrains, patterns[:2])
+plt.savefig("patterns0.png")
+figure = plt.figure()
+axes = viziphant.patterns.plot_patterns_statistics_all(patterns)
+plt.savefig("patterns1.png")
+cv_list = [cv(isi(spiketrain)) for spiketrain in spiketrains]
+plt.hist(cv_list)
+plt.savefig("cv_hist.png")
+try:
+    UE = ue.jointJ_window_analysis(
+        spiketrains_np, binsize=5*pq.ms, winsize=100*pq.ms, winstep=10*pq.ms, pattern_hash=[3])
+    #print(UE)
+    plot_UE(spiketrains_np, UE, ue.jointJ(0.05),binsize=5*pq.ms,winsize=100*pq.ms,winstep=10*pq.ms,
+            pat=ue.inverse_hash_from_pattern([3], N=2), N=2,
+            t_winpos=ue._winpos(0*pq.ms,spiketrains[0][0].t_stop,winsize=100*pq.ms,winstep=10*pq.ms))
+    plt.savefig("unitary_event_analysis.png")
+
+except:
+    pass
+
+#st.pyplot()
